@@ -1,0 +1,984 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Swords, ChefHat, Handshake, Lock, X, Brain, Trophy } from 'lucide-react';
+
+// --- データ定義 ---
+const MONSTERS = [
+  { id: 'm1', name: 'マンドラゴラ', target: 2, drop: (d) => d <= 3 ? ['野菜'] : ['魔力エキス'] },
+  { id: 'm2', name: 'カスタード・スライム', target: 2, drop: (d) => d <= 3 ? ['卵'] : ['魔力エキス'] },
+  { id: 'm3', name: 'パズフィッシュ', target: 4, drop: (d) => d <= 3 ? ['魚'] : d <= 5 ? ['骨'] : ['魚', '骨'] },
+  { id: 'm4', name: 'スケルトン', target: 4, drop: (d) => d <= 4 ? ['骨'] : ['魔力エキス'], bonus: 'chie' },
+  { id: 'm5', name: 'フレイムホーク', target: 4, drop: (d) => d <= 3 ? ['肉'] : d <= 5 ? ['卵'] : ['肉', '卵'] },
+  { id: 'm6', name: 'アーマーボア', target: 5, drop: () => ['肉', '骨'], noDropDice: true },
+  { id: 'm7', name: 'キング・ワイバーン', target: 6, drop: (d) => d <= 2 ? ['卵'] : d <= 5 ? ['肉'] : ['竜の極上肉'] },
+];
+
+const RAW_ORDERS = [
+  ...Array(3).fill({ name: 'マンドラゴラの薬膳野菜炒め', pt: 10, req: ['野菜', '魔力エキス'], any: 0 }),
+  ...Array(2).fill({ name: 'パズフィッシュの骨せんべい', pt: 10, req: ['魚', '骨'], any: 0 }),
+  ...Array(2).fill({ name: 'カスタード・スライムのふわ卵焼き', pt: 15, req: ['卵', '魔力エキス'], any: 1 }),
+  ...Array(2).fill({ name: 'ワイルド骨付き肉のロースト', pt: 15, req: ['肉', '骨'], any: 0 }),
+  ...Array(3).fill({ name: 'フレイムホークの熱々雑炊', pt: 20, req: ['肉', '卵', '骨'], any: 0 }),
+  ...Array(2).fill({ name: '魔女の気まぐれ海鮮サラダ', pt: 20, req: ['魚', '野菜', '魔力エキス'], any: 0 }),
+  ...Array(2).fill({ name: 'パズフィッシュの地獄スープ', pt: 25, req: ['魚', '骨', '魔力エキス'], any: 1 }),
+  ...Array(2).fill({ name: '竜王の極上・骨付き肉グリル', pt: 40, req: ['竜の極上肉', '骨', '野菜'], any: 0 }),
+];
+
+const TARGET_PT = 60;
+
+const ITEM_COLORS = {
+  '野菜': 'bg-green-100 text-green-800 border-green-300',
+  '魔力エキス': 'bg-purple-100 text-purple-800 border-purple-300',
+  '卵': 'bg-yellow-100 text-yellow-800 border-yellow-300',
+  '魚': 'bg-blue-100 text-blue-800 border-blue-300',
+  '骨': 'bg-gray-100 text-gray-800 border-gray-300',
+  '肉': 'bg-red-100 text-red-800 border-red-300',
+  '竜の極上肉': 'bg-gradient-to-r from-yellow-300 to-yellow-500 text-white border-yellow-600 font-bold',
+};
+
+// --- ヘルパー関数 ---
+const shuffle = (array) => {
+  const newArr = [...array];
+  for (let i = newArr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [newArr[i], newArr[j]] = [newArr[j], newArr[i]];
+  }
+  return newArr;
+};
+
+const rollDice = () => Math.floor(Math.random() * 6) + 1;
+
+const checkCookable = (order, items) => {
+  if (!order) return false;
+  let tempItems = [...items];
+  for (let req of order.req) {
+    let idx = tempItems.indexOf(req);
+    if (idx === -1) return false;
+    tempItems.splice(idx, 1);
+  }
+  return tempItems.length >= order.any;
+};
+
+const consumeItemsForOrder = (order, items) => {
+  let tempItems = [...items];
+  for (let req of order.req) {
+    let idx = tempItems.indexOf(req);
+    tempItems.splice(idx, 1);
+  }
+  for (let i = 0; i < order.any; i++) {
+    tempItems.splice(0, 1);
+  }
+  return tempItems;
+};
+
+const getMissingItems = (order, items) => {
+  let tempItems = [...items];
+  let missing = [];
+  for (let req of order.req) {
+      let idx = tempItems.indexOf(req);
+      if (idx === -1) {
+          missing.push(req);
+      } else {
+          tempItems.splice(idx, 1);
+      }
+  }
+  const anyMissingCount = Math.max(0, order.any - tempItems.length);
+  for (let i = 0; i < anyMissingCount; i++) {
+      missing.push('任意'); 
+  }
+  return missing;
+};
+
+// 場と全員のキープ数の合計が3未満なら山札から補充する処理
+const replenishFields = (currentFields, currentDeck, keepCount) => {
+  let newFields = [...currentFields];
+  let newDeck = [...currentDeck];
+  while (newFields.length + keepCount < 3 && newDeck.length > 0) {
+    newFields.push(newDeck.shift());
+  }
+  return { newFields, newDeck };
+};
+
+export default function App() {
+  // --- 状態管理 ---
+  const [deck, setDeck] = useState([]);
+  const [fieldOrders, setFieldOrders] = useState([]);
+  
+  const [players, setPlayers] = useState({
+    p1: { name: 'あんた', type: 'player', pt: 0, items: [], chie: 0, keep: null, cannotKeepId: null },
+    c1: { name: '私', type: 'cpu', pt: 0, items: [], chie: 0, keep: null, cannotKeepId: null },
+    c2: { name: 'ライバル', type: 'cpu', pt: 0, items: [], chie: 0, keep: null, cannotKeepId: null }
+  });
+  
+  const [turnOrder, setTurnOrder] = useState([]);
+  const [turnIdx, setTurnIdx] = useState(-1);
+  const [actionsLeft, setActionsLeft] = useState(2);
+  const [logs, setLogs] = useState([]);
+  const [modalState, setModalState] = useState(null);
+  const [winner, setWinner] = useState(null);
+  
+  const logsEndRef = useRef(null);
+
+  // CPUロジック用に最新のStateを参照するためのRef
+  const playersRef = useRef(players);
+  const fieldOrdersRef = useRef(fieldOrders);
+  const deckRef = useRef(deck);
+  useEffect(() => { playersRef.current = players; }, [players]);
+  useEffect(() => { fieldOrdersRef.current = fieldOrders; }, [fieldOrders]);
+  useEffect(() => { deckRef.current = deck; }, [deck]);
+
+  // 初期化
+  useEffect(() => {
+    const initialDeck = shuffle(RAW_ORDERS.map((o, i) => ({ ...o, id: `o${i}` })));
+    setFieldOrders(initialDeck.slice(0, 3)); // 最初はキープがないので3枚
+    setDeck(initialDeck.slice(3));
+
+    const ids = ['p1', 'c1', 'c2'];
+    const shuffledIds = shuffle(ids);
+    setTurnOrder(shuffledIds);
+    setTurnIdx(0);
+
+    const firstPlayerName = playersRef.current[shuffledIds[0]].name;
+    setLogs([
+      "ゲームスタート！私が進行役だよ！今回はライバルちゃんも交えて1v1v1だからね！",
+      `順番はランダムで決めたよ！一番手は【${firstPlayerName}】から！`
+    ]);
+  }, []);
+
+  const resetGame = () => {
+    const initialPlayers = {
+      p1: { name: 'あんた', type: 'player', pt: 0, items: [], chie: 0, keep: null, cannotKeepId: null },
+      c1: { name: '私', type: 'cpu', pt: 0, items: [], chie: 0, keep: null, cannotKeepId: null },
+      c2: { name: 'ライバル', type: 'cpu', pt: 0, items: [], chie: 0, keep: null, cannotKeepId: null }
+    };
+    setPlayers(initialPlayers);
+    setWinner(null);
+    setActionsLeft(2);
+    setModalState(null);
+
+    const initialDeck = shuffle(RAW_ORDERS.map((o, i) => ({ ...o, id: `o${i}` })));
+    setFieldOrders(initialDeck.slice(0, 3));
+    setDeck(initialDeck.slice(3));
+
+    const ids = ['p1', 'c1', 'c2'];
+    const shuffledIds = shuffle(ids);
+    setTurnOrder(shuffledIds);
+    setTurnIdx(0);
+
+    const firstPlayerName = initialPlayers[shuffledIds[0]].name;
+    setLogs([
+      "よーし、もう一回勝負だね！次は負けないから！",
+      `順番はランダムで決めたよ！一番手は【${firstPlayerName}】から！`
+    ]);
+  };
+
+  // ログ自動スクロール
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
+
+  // 終了判定
+  useEffect(() => {
+    if (winner) return;
+    for (const [id, p] of Object.entries(players)) {
+      if (p.pt >= TARGET_PT) {
+        setWinner(id);
+        if (id === 'p1') {
+          addLog(`あっ……あんたのポイントが${p.pt}ptになった！あんたの勝ちだね！`);
+        } else {
+          addLog(`やったー！${p.name}が${p.pt}ptに到達！${p.name}の勝ちだよ！`);
+        }
+        break;
+      }
+    }
+  }, [players, winner]);
+
+  const addLog = (msg) => {
+    setLogs(prev => [...prev, msg]);
+  };
+
+  const useAction = () => {
+    setActionsLeft(prev => prev - 1);
+  };
+
+  // --- ターン進行とCPUロジック ---
+  useEffect(() => {
+    if (turnIdx === -1 || winner || modalState) return;
+
+    const currentId = turnOrder[turnIdx];
+
+    // アクションを使い切ったら自動で次のターンへ＆キープの期限処理
+    if (actionsLeft === 0) {
+      const nextIdx = (turnIdx + 1) % 3;
+      const nextId = turnOrder[nextIdx];
+      const me = players[currentId];
+      
+      let returnedOrder = null;
+      let nextCannotKeepId = null;
+      let newKeep = me.keep;
+
+      if (me.keep) {
+        if (me.keep.isNew) {
+          // キープした直後なので、次の自分のターンまで有効にする
+          newKeep = { ...me.keep, isNew: false };
+        } else {
+          // 次の自分のターンまで回ってきたのに料理しなかったから破棄！
+          returnedOrder = { ...me.keep };
+          delete returnedOrder.isNew;
+          nextCannotKeepId = returnedOrder.id; // 直後のターンで同じのはキープ禁止！
+          newKeep = null;
+        }
+      }
+
+      setPlayers(prev => ({
+        ...prev,
+        [currentId]: { ...prev[currentId], keep: newKeep, cannotKeepId: nextCannotKeepId }
+      }));
+
+      if (returnedOrder) {
+        addLog(`【${me.name}】がキープしてた「${returnedOrder.name}」は有効期限切れで場に戻ったよ！`);
+        setFieldOrders(prev => [...prev, returnedOrder]);
+      }
+
+      addLog(`【${me.name}】のターン終わり！次は【${players[nextId].name}】の番だよ！`);
+      setTurnIdx(nextIdx);
+      setActionsLeft(2);
+      
+      return; // ターン切り替え処理を行った場合はここで抜ける
+    }
+
+    // CPUのターンの場合
+    if (players[currentId].type === 'cpu' && actionsLeft > 0) {
+      const timer = setTimeout(() => {
+        executeCpuAction(currentId);
+      }, 1500);
+      return () => clearTimeout(timer);
+    }
+  }, [turnIdx, actionsLeft, modalState, winner, players, turnOrder]);
+
+  const executeCpuAction = (cpuId) => {
+    const pList = playersRef.current;
+    const fList = fieldOrdersRef.current;
+    const dList = deckRef.current;
+    const me = pList[cpuId];
+
+    // 1. 作れるオーダーを探す（場から）
+    const cookableFieldIdx = fList.findIndex(o => o && checkCookable(o, me.items));
+    if (cookableFieldIdx !== -1) {
+      const order = fList[cookableFieldIdx];
+      addLog(`${me.name}が「${order.name}」を作るよ！`);
+      
+      setPlayers(prev => ({
+        ...prev,
+        [cpuId]: { ...prev[cpuId], pt: prev[cpuId].pt + order.pt, items: consumeItemsForOrder(order, prev[cpuId].items) }
+      }));
+      
+      let newFields = [...fList];
+      newFields.splice(cookableFieldIdx, 1);
+      
+      // 補充処理（誰かのキープ枠があればその分は補充しない）
+      let keepCount = Object.values(pList).filter(p => p.keep).length;
+      const { newFields: replenishedFields, newDeck } = replenishFields(newFields, dList, keepCount);
+      setFieldOrders(replenishedFields);
+      setDeck(newDeck);
+      
+      useAction();
+      return;
+    }
+
+    // キープ調理
+    if (me.keep && checkCookable(me.keep, me.items)) {
+      addLog(`${me.name}がキープしてた「${me.keep.name}」を作るよ！`);
+      const orderId = me.keep.id;
+      
+      setPlayers(prev => ({
+        ...prev,
+        [cpuId]: { 
+          ...prev[cpuId], 
+          pt: prev[cpuId].pt + me.keep.pt, 
+          items: consumeItemsForOrder(me.keep, prev[cpuId].items), 
+          keep: null,
+          cannotKeepId: orderId // 作って手放したから、次のターンに同じのはキープ禁止
+        }
+      }));
+      
+      // キープがなくなった分、場の空き枠ができるから補充を試みる
+      let keepCount = Object.values(pList).filter(p => p.keep).length - 1; // 自分がキープ手放した分引く
+      const { newFields: replenishedFields, newDeck } = replenishFields(fList, dList, keepCount);
+      setFieldOrders(replenishedFields);
+      setDeck(newDeck);
+      
+      useAction();
+      return;
+    }
+
+    // 2. 賢くキープする
+    if (!me.keep) {
+      for (let i = 0; i < fList.length; i++) {
+        const o = fList[i];
+        if (!o) continue;
+        if (me.cannotKeepId === o.id) continue; // 直前に手放したものはキープしない
+        
+        const missing = getMissingItems(o, me.items);
+        if (missing.length === 1 && o.pt >= 15) {
+          addLog(`おっと、${me.name}が「${o.name}」をキープしたね！`);
+          setPlayers(prev => ({ ...prev, [cpuId]: { ...prev[cpuId], keep: { ...o, isNew: true } } }));
+          
+          const newFields = [...fList];
+          newFields.splice(i, 1);
+          setFieldOrders(newFields);
+          // キープしただけだから山札からの補充はしないよ！
+          
+          useAction();
+          return;
+        }
+      }
+    }
+
+    // 3. 狩猟
+    let targetItems = [];
+    if (me.keep) {
+      targetItems = getMissingItems(me.keep, me.items);
+    } else {
+      const sortedFields = [...fList].filter(o => o !== null).sort((a,b) => b.pt - a.pt);
+      if (sortedFields.length > 0) targetItems = getMissingItems(sortedFields[0], me.items);
+    }
+
+    let targetMonster = null;
+    if (targetItems.length > 0) {
+      const needed = targetItems[0];
+      const candidates = MONSTERS.filter(m => m.drop.toString().includes(needed) || (m.noDropDice && m.drop().includes(needed)));
+      if (candidates.length > 0) targetMonster = candidates[Math.floor(Math.random() * candidates.length)];
+    }
+    if (!targetMonster) targetMonster = MONSTERS[Math.floor(Math.random() * MONSTERS.length)];
+
+    let chieToUse = 0;
+    if (me.chie > 0 && targetMonster.target >= 5) {
+      chieToUse = Math.min(me.chie, targetMonster.target - 3);
+      if (chieToUse < 0) chieToUse = 0;
+    }
+
+    addLog(`${me.name}は「${targetMonster.name}」を狩りに行くよ！`);
+    const dice1 = rollDice();
+    const total1 = Math.min(6, dice1 + chieToUse);
+
+    if (total1 >= targetMonster.target) {
+      addLog(`狩猟成功！出目は${dice1}${chieToUse>0?`（＋知恵で${total1}）`:''}だね！`);
+      
+      let gotItems = [];
+      if (targetMonster.noDropDice) {
+        gotItems = targetMonster.drop();
+      } else {
+        const dice2 = rollDice();
+        gotItems = targetMonster.drop(dice2);
+        addLog(`ドロップ判定は${dice2}！`);
+      }
+
+      let bonusMsg = "";
+      let chieBonus = 0;
+      if (targetMonster.bonus === 'chie') {
+        chieBonus = 1;
+        bonusMsg = "ボーナスで知恵トークンもゲット！";
+      }
+
+      addLog(`【${gotItems.join('、')}】を手に入れたよ！${bonusMsg}`);
+
+      // STATEの二重更新を避けるために事前に計算してセットする
+      let currentItems = [...me.items, ...gotItems];
+      let droppedMessages = [];
+      while (currentItems.length > 5) {
+        const dropIdx = Math.floor(Math.random() * currentItems.length);
+        droppedMessages.push(`${me.name}は持ち物がいっぱいだから、【${currentItems[dropIdx]}】を捨てたよ。`);
+        currentItems.splice(dropIdx, 1);
+      }
+      
+      droppedMessages.forEach(msg => addLog(msg));
+
+      setPlayers(prev => ({
+        ...prev,
+        [cpuId]: { ...prev[cpuId], items: currentItems, chie: prev[cpuId].chie - chieToUse + chieBonus }
+      }));
+    } else {
+      addLog(`あーあ、失敗… 出目は${dice1}${chieToUse>0?`（＋知恵で${total1}）`:''}だった。残念賞の知恵トークンをゲットだね。`);
+      setPlayers(prev => ({ 
+        ...prev, 
+        [cpuId]: { ...prev[cpuId], chie: prev[cpuId].chie - chieToUse + 1 } 
+      }));
+    }
+    useAction();
+  };
+
+  const isPlayerTurn = turnIdx !== -1 && turnOrder[turnIdx] === 'p1';
+
+  // --- プレイヤーアクションハンドラ ---
+  const handleHuntClick = () => {
+    if (!isPlayerTurn || actionsLeft <= 0) return;
+    setModalState({ type: 'selectMonster' });
+  };
+
+  const handleHuntStart = (monster, chieUsed) => {
+    setModalState(null);
+    setPlayers(prev => ({ ...prev, p1: { ...prev.p1, chie: prev.p1.chie - chieUsed } }));
+    addLog(`あんたは「${monster.name}」に挑むんだね！知恵トークン${chieUsed}個使うね。`);
+    
+    const dice = rollDice();
+    const total = Math.min(6, dice + chieUsed);
+    
+    setTimeout(() => {
+      if (total >= monster.target) {
+        addLog(`出目${dice}！合計${total}で狩猟成功だよ！やるじゃん！`);
+        if (monster.bonus === 'chie') {
+          setPlayers(prev => ({ ...prev, p1: { ...prev.p1, chie: prev.p1.chie + 1 } }));
+          addLog("スケルトンの討伐ボーナスで知恵トークン1個ゲットだね！");
+        }
+        
+        if (monster.noDropDice) {
+          const gotItems = monster.drop();
+          processGotItems(gotItems);
+        } else {
+          setTimeout(() => {
+            setModalState({ type: 'dropDice', monster, chieUsed: 0 });
+          }, 1000);
+        }
+      } else {
+        addLog(`出目${dice}……合計${total}で失敗だよ。残念！でも知恵トークンあげるから次がんばって！`);
+        setPlayers(prev => ({ ...prev, p1: { ...prev.p1, chie: prev.p1.chie + 1 } }));
+        useAction();
+      }
+    }, 1000);
+  };
+
+  const handleDropRoll = (monster, chieUsed) => {
+    setModalState(null);
+    setPlayers(prev => ({ ...prev, p1: { ...prev.p1, chie: prev.p1.chie - chieUsed } }));
+    
+    const dice = rollDice();
+    const total = Math.min(6, dice + chieUsed);
+    addLog(`ドロップ判定の出目は${dice}！合計${total}だよ！`);
+    
+    const gotItems = monster.drop(total);
+    processGotItems(gotItems);
+  };
+
+  const processGotItems = (gotItems) => {
+    addLog(`【${gotItems.join('、')}】をゲットしたよ！`);
+    
+    // STATEの二重更新を避けるために、先に情報を計算してから振り分ける
+    const currentItems = playersRef.current.p1.items;
+    const newItems = [...currentItems, ...gotItems];
+    
+    if (newItems.length > 5) {
+      setModalState({ type: 'discard', items: newItems, dropCount: newItems.length - 5 });
+    } else {
+      setPlayers(prev => ({ ...prev, p1: { ...prev.p1, items: newItems } }));
+      useAction();
+    }
+  };
+
+  const handleDiscard = (remainingItems) => {
+    setModalState(null);
+    setPlayers(prev => ({ ...prev, p1: { ...prev.p1, items: remainingItems } }));
+    addLog("いらない素材を捨てたね。");
+    useAction();
+  };
+
+  const handleCook = (order, sourceIdx, isKeep = false) => {
+    if (!isPlayerTurn || actionsLeft <= 0) return;
+    const me = players.p1;
+    if (!checkCookable(order, me.items)) return;
+
+    // キープを手放した（料理した）なら、直後のターンで同じオーダーのキープを禁止する
+    let nextCannotKeepId = me.cannotKeepId;
+    if (isKeep) nextCannotKeepId = order.id;
+
+    setPlayers(prev => ({
+      ...prev,
+      p1: {
+        ...prev.p1,
+        pt: prev.p1.pt + order.pt,
+        items: consumeItemsForOrder(order, prev.p1.items),
+        keep: isKeep ? null : prev.p1.keep,
+        cannotKeepId: nextCannotKeepId
+      }
+    }));
+    
+    addLog(`おっ、「${order.name}」を完成させたね！${order.pt}ptゲット！やるじゃん！`);
+    
+    let newFields = [...fieldOrders];
+    if (!isKeep) {
+      newFields.splice(sourceIdx, 1);
+    }
+    
+    let keepCount = Object.values(players).filter(p => p.keep).length;
+    if (isKeep) keepCount--; // 今調理した分を減らす
+
+    const { newFields: replenishedFields, newDeck } = replenishFields(newFields, deck, keepCount);
+    setFieldOrders(replenishedFields);
+    setDeck(newDeck);
+    
+    useAction();
+  };
+
+  const handleKeep = (order, sourceIdx) => {
+    if (!isPlayerTurn || actionsLeft <= 0) return;
+    if (players.p1.keep) {
+      addLog("すでにキープしてるオーダーがあるよ！");
+      return;
+    }
+    if (players.p1.cannotKeepId === order.id) {
+      addLog("さっき手放したばかりのオーダーは連続でキープできないよ！");
+      return;
+    }
+
+    setPlayers(prev => ({ ...prev, p1: { ...prev.p1, keep: { ...order, isNew: true } } }));
+    
+    const newFields = [...fieldOrders];
+    newFields.splice(sourceIdx, 1);
+    setFieldOrders(newFields);
+    // 補充はしないよ！
+    
+    addLog(`「${order.name}」をキープしたね！私が作ろうと思ってたのに〜！`);
+    useAction();
+  };
+
+  const handleNegotiate = () => {
+    if (!isPlayerTurn || actionsLeft <= 0) return;
+    const me = players.p1;
+    if (me.items.length === 0) {
+      addLog("ちょっと！あんた素材持ってないじゃん！交渉できないよ！");
+      return;
+    }
+    
+    const targets = ['c1', 'c2'].filter(id => players[id].items.length > 0);
+    if (targets.length === 0) {
+      addLog("他の2人とも素材を持ってないみたい！今は交渉できないね！");
+      return;
+    }
+    
+    const targetId = targets[Math.floor(Math.random() * targets.length)];
+    const target = players[targetId];
+
+    const pDropIdx = Math.floor(Math.random() * me.items.length);
+    const pGiveItem = me.items[pDropIdx];
+    
+    const cDropIdx = Math.floor(Math.random() * target.items.length);
+    const cGiveItem = target.items[cDropIdx];
+
+    setPlayers(prev => {
+      const newMeItems = [...prev.p1.items];
+      newMeItems.splice(pDropIdx, 1);
+      newMeItems.push(cGiveItem);
+
+      const newTargetItems = [...prev[targetId].items];
+      newTargetItems.splice(cDropIdx, 1);
+      newTargetItems.push(pGiveItem);
+
+      return {
+        ...prev,
+        p1: { ...prev.p1, items: newMeItems, chie: prev.p1.chie + 1 },
+        [targetId]: { ...prev[targetId], items: newTargetItems }
+      };
+    });
+
+    addLog(`交渉成立！あんたの【${pGiveItem}】と${target.name}の【${cGiveItem}】を交換したよ。ボーナスの知恵トークンもゲットだね！`);
+    useAction();
+  };
+
+  const endPlayerTurn = () => {
+    setActionsLeft(0);
+  }
+
+  // --- UIコンポーネント ---
+  const ItemBadge = ({ item, onClick }) => (
+    <span 
+      onClick={onClick}
+      className={`inline-block px-2 py-1 m-1 text-xs rounded border cursor-default select-none 
+      ${ITEM_COLORS[item] || 'bg-white'} 
+      ${onClick ? 'cursor-pointer hover:opacity-80' : ''}`}
+    >
+      {item}
+    </span>
+  );
+
+  const OrderCard = ({ order, onCook, onKeep, cookable, cannotKeep, isKeep = false, isPlayerTurn, winner }) => {
+    if (!order) return null; // 枠そのものを出さずに詰めて表示する
+    
+    return (
+      <div className={`w-48 h-64 rounded-xl shadow-md border-2 bg-white flex flex-col p-3 relative ${cookable ? 'border-green-400 ring-2 ring-green-200' : 'border-amber-200'}`}>
+        <div className="absolute top-0 right-0 bg-red-500 text-white font-bold px-2 py-1 rounded-bl-lg rounded-tr-lg text-sm flex items-center shadow">
+          <Trophy size={14} className="mr-1"/> {order.pt}pt
+        </div>
+        <h3 className="font-bold text-gray-800 text-sm mt-4 mb-2 h-10 leading-tight">{order.name}</h3>
+        <div className="flex-1 bg-gray-50 rounded p-2 text-xs">
+          <p className="font-semibold text-gray-500 mb-1 border-b pb-1">必要素材:</p>
+          <div className="flex flex-wrap">
+            {order.req.map((req, i) => <ItemBadge key={i} item={req} />)}
+            {order.any > 0 && <span className="inline-block px-2 py-1 m-1 text-xs rounded border bg-gray-200 text-gray-600">＋任意{order.any}個</span>}
+          </div>
+        </div>
+        {isPlayerTurn && !winner && (
+          <div className="mt-2 flex gap-1">
+            <button 
+              onClick={onCook}
+              disabled={!cookable}
+              className={`flex-1 py-1.5 rounded text-sm font-bold transition flex items-center justify-center ${cookable ? 'bg-green-500 hover:bg-green-600 text-white shadow-sm' : 'bg-gray-200 text-gray-400 cursor-not-allowed'}`}
+            >
+              <ChefHat size={16} className="mr-1"/> 作る
+            </button>
+            {!isKeep && (
+              <button 
+                onClick={onKeep}
+                disabled={cannotKeep}
+                title={cannotKeep ? "手放した直後のカードだからキープできないよ！" : ""}
+                className={`flex-1 py-1.5 rounded text-sm font-bold transition flex items-center justify-center border ${cannotKeep ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed' : 'bg-amber-100 hover:bg-amber-200 text-amber-700 border-amber-300'}`}
+              >
+                <Lock size={16} className="mr-1"/> キープ
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-amber-50 text-gray-800 font-sans p-4 flex flex-col md:flex-row gap-4 max-w-6xl mx-auto">
+      {/* メインゲームエリア */}
+      <div className="flex-1 flex flex-col gap-4">
+        
+        {/* ヘッダー情報（スコア等） */}
+        <div className="flex justify-between items-center bg-white p-4 rounded-2xl shadow-sm border border-amber-100">
+          {Object.entries(players).map(([id, p]) => (
+            <div key={id} className={`text-center flex-1 ${id === 'c1' ? 'border-x border-gray-200' : ''}`}>
+              <p className="text-sm text-gray-500 font-bold mb-1">{p.name}</p>
+              <p className="text-2xl font-black text-gray-700 flex justify-center items-center gap-2">
+                <Trophy className={id === 'p1' ? 'text-blue-500' : 'text-red-500'} size={20}/> 
+                {p.pt} <span className="text-sm text-gray-400">/ {TARGET_PT}</span>
+              </p>
+            </div>
+          ))}
+        </div>
+        
+        <div className="text-center mb-2">
+          <p className="font-bold text-amber-800 bg-amber-100 rounded-full inline-block px-4 py-1 mb-1 shadow-sm">
+            {winner ? 'ゲーム終了！' : `Turn: ${players[turnOrder[turnIdx]]?.name}の番！`}
+          </p>
+          {!winner && (
+            <div className="text-sm font-bold text-gray-600 flex items-center justify-center gap-1">
+              残りアクション: 
+              <span className="flex gap-1">
+                {[...Array(2)].map((_, i) => (
+                  <span key={i} className={`block w-4 h-4 rounded-full ${i < actionsLeft ? (isPlayerTurn ? 'bg-blue-500' : 'bg-red-500') : 'bg-gray-200'}`} />
+                ))}
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* 場のオーダー */}
+        <div className="bg-amber-100/50 p-6 rounded-2xl border border-amber-200 min-h-[300px]">
+          <h2 className="text-lg font-bold text-amber-800 mb-4 flex items-center">
+            <ChefHat className="mr-2" /> 場のオーダー <span className="text-sm font-normal text-gray-500 ml-2">(山札残り: {deck.length}枚)</span>
+          </h2>
+          <div className="flex justify-center gap-4 flex-wrap">
+            {fieldOrders.map((o, i) => {
+              if (!o) return null;
+              return (
+                <OrderCard 
+                  key={o.id} 
+                  order={o} 
+                  cookable={checkCookable(o, players.p1.items)}
+                  cannotKeep={players.p1.cannotKeepId === o.id}
+                  onCook={() => handleCook(o, i)}
+                  onKeep={() => handleKeep(o, i)}
+                  isPlayerTurn={isPlayerTurn && actionsLeft > 0}
+                  winner={winner}
+                />
+              );
+            })}
+            {fieldOrders.filter(o => o !== null).length === 0 && (
+              <div className="w-full text-center text-amber-500 font-bold py-10">場のオーダーは全部キープされてるよ！</div>
+            )}
+          </div>
+        </div>
+
+        {/* 全員の持ち物エリア */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {['p1', 'c1', 'c2'].map(id => {
+            const p = players[id];
+            const isMyTurn = turnOrder[turnIdx] === id;
+            const borderColor = id === 'p1' ? 'border-blue-300 ring-blue-100' : 'border-red-300 ring-red-100';
+            const bgColor = id === 'p1' ? 'bg-blue-50' : 'bg-red-50';
+            const titleColor = id === 'p1' ? 'text-blue-800 border-blue-200' : 'text-red-800 border-red-200';
+            const iconColor = id === 'p1' ? 'text-blue-100' : 'text-red-100';
+
+            return (
+              <div key={id} className={`flex-1 p-4 rounded-2xl border-2 transition ${isMyTurn ? `${bgColor} ${borderColor} ring-2 shadow-md` : 'bg-white border-gray-200'}`}>
+                <h2 className={`font-bold mb-2 border-b-2 pb-1 ${titleColor}`}>{p.name}の持ち物</h2>
+                
+                <div className={`flex items-center gap-2 mb-3 bg-white p-2 rounded-lg border ${iconColor.replace('text-', 'border-')}`}>
+                  <Brain className="text-yellow-500" size={20} />
+                  <span className="font-bold text-sm text-gray-600">知恵:</span>
+                  <span className="font-black text-lg">{p.chie}</span>個
+                </div>
+                
+                <div className={`mb-3 bg-white p-2 rounded-lg border min-h-[80px] ${iconColor.replace('text-', 'border-')}`}>
+                  <p className="text-xs text-gray-500 font-bold mb-1 flex justify-between">
+                    <span>素材</span>
+                    <span>{p.items.length}/5</span>
+                  </p>
+                  <div className="flex flex-wrap">
+                    {p.items.map((item, i) => <ItemBadge key={i} item={item} />)}
+                    {p.items.length === 0 && <span className="text-xs text-gray-400 p-1">からっぽ！</span>}
+                  </div>
+                </div>
+
+                <div className={`bg-white p-2 rounded-lg border flex flex-col gap-1 items-start min-h-[120px] ${iconColor.replace('text-', 'border-')}`}>
+                  <div className="text-xs text-gray-500 font-bold pt-1 flex justify-between w-full">
+                    <span>キープ:</span>
+                    {p.keep && <span className={`text-[10px] px-1 rounded ${p.keep.isNew ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>{p.keep.isNew ? 'New!' : '期限間近'}</span>}
+                  </div>
+                  <div className="w-full flex-1 flex flex-col items-center justify-center">
+                    {p.keep ? (
+                      id === 'p1' ? (
+                        <OrderCard 
+                          order={p.keep} 
+                          isKeep={true} 
+                          cookable={checkCookable(p.keep, p.items)}
+                          onCook={() => handleCook(p.keep, null, true)}
+                          isPlayerTurn={isPlayerTurn && actionsLeft > 0}
+                          winner={winner}
+                        />
+                      ) : (
+                        <div className="w-full text-center text-sm font-bold text-gray-700 bg-amber-50 p-2 border border-amber-200 rounded shadow-sm">
+                          {p.keep.name}
+                        </div>
+                      )
+                    ) : (
+                      <div className="w-full text-xs text-gray-400 italic bg-gray-50 h-full rounded flex items-center justify-center border border-dashed border-gray-300 p-2">
+                        キープしてないよ
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* サイドパネル（アクション＆ログ） */}
+      <div className="w-full md:w-80 flex flex-col gap-4 shrink-0">
+        
+        {/* アクションメニュー */}
+        <div className={`bg-white p-4 rounded-2xl shadow-sm border-2 ${isPlayerTurn && !winner ? 'border-blue-400 ring-2 ring-blue-100' : 'border-gray-200 opacity-70'}`}>
+          <h2 className="font-black text-lg text-gray-800 mb-3 flex items-center">
+            <Swords className="mr-2 text-blue-500" /> アクション
+          </h2>
+          <div className="flex flex-col gap-2">
+            {winner ? (
+              <button 
+                onClick={resetGame}
+                className="w-full py-4 bg-gradient-to-r from-amber-400 to-orange-500 hover:from-amber-500 hover:to-orange-600 text-white font-bold rounded-xl shadow-lg transition text-lg flex items-center justify-center animate-bounce"
+              >
+                🔄 もう一度遊ぶ！
+              </button>
+            ) : (
+              <>
+                <button 
+                  onClick={handleHuntClick}
+                  disabled={!isPlayerTurn || actionsLeft <= 0 || winner}
+                  className="py-3 px-4 bg-red-500 hover:bg-red-600 text-white font-bold rounded-xl shadow transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                >
+                  <Swords className="mr-2" size={20}/> 狩猟する（ダイス）
+                </button>
+                <button 
+                  onClick={handleNegotiate}
+                  disabled={!isPlayerTurn || actionsLeft <= 0 || winner}
+                  className="py-3 px-4 bg-purple-500 hover:bg-purple-600 text-white font-bold rounded-xl shadow transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                >
+                  <Handshake className="mr-2" size={20}/> 交渉する（ランダム交換）
+                </button>
+                
+                <div className="mt-4 pt-4 border-t border-gray-100">
+                   <p className="text-xs text-gray-500 mb-2">※「料理」「キープ」はオーダーカードのボタンを押してね。</p>
+                   {isPlayerTurn && actionsLeft > 0 && actionsLeft < 2 && (
+                     <button 
+                       onClick={endPlayerTurn}
+                       className="w-full py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 font-bold rounded-lg transition"
+                     >
+                       ターンを終了する
+                     </button>
+                   )}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* ログウィンドウ（進行役ちゃん） */}
+        <div className="flex-1 bg-white rounded-2xl shadow-sm border border-gray-200 flex flex-col overflow-hidden min-h-[300px] max-h-[500px]">
+          <div className="bg-amber-400 text-amber-900 font-bold p-3 flex items-center text-sm shadow-sm z-10">
+            <span className="text-xl mr-2">👧</span> 進行役ちゃんのログ
+          </div>
+          <div className="flex-1 p-4 overflow-y-auto bg-gray-50 flex flex-col gap-3">
+            {logs.map((log, i) => (
+              <div key={i} className="bg-white border border-gray-200 p-3 rounded-2xl rounded-tl-none text-sm text-gray-700 shadow-sm relative ml-2 mt-1">
+                {/* 吹き出しの尻尾 */}
+                <div className="absolute top-0 -left-2 w-0 h-0 border-t-[10px] border-t-transparent border-r-[10px] border-r-white border-b-[10px] border-b-transparent drop-shadow-sm"></div>
+                {log}
+              </div>
+            ))}
+            <div ref={logsEndRef} />
+          </div>
+        </div>
+
+      </div>
+
+      {/* --- モーダル群 --- */}
+      {modalState?.type === 'selectMonster' && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-6 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl border-4 border-amber-300">
+            <h2 className="text-2xl font-black text-amber-800 mb-4 flex items-center justify-between">
+              <span>どのモンスターを狩る？</span>
+              <button onClick={() => setModalState(null)} className="p-1 bg-gray-100 hover:bg-gray-200 rounded-full text-gray-500"><X size={24}/></button>
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {MONSTERS.map(m => (
+                <div key={m.id} className="border-2 border-gray-200 rounded-xl p-3 hover:border-red-400 hover:bg-red-50 cursor-pointer transition flex flex-col"
+                  onClick={() => setModalState({ type: 'confirmHunt', monster: m, chieUsed: 0 })}
+                >
+                  <div className="flex justify-between items-center mb-2 border-b pb-1">
+                    <span className="font-bold text-lg">{m.name}</span>
+                    <span className="bg-red-100 text-red-700 font-bold px-2 py-0.5 rounded text-sm">目標: {m.target}</span>
+                  </div>
+                  <div className="text-xs text-gray-600 flex-1">
+                    <p className="font-semibold text-gray-500">ドロップ:</p>
+                    {m.id === 'm1' && <p>1-3:野菜 / 4-6:魔力エキス</p>}
+                    {m.id === 'm2' && <p>1-3:卵 / 4-6:魔力エキス</p>}
+                    {m.id === 'm3' && <p>1-3:魚 / 4-5:骨 / 6:魚+骨</p>}
+                    {m.id === 'm4' && <p>1-4:骨 / 5-6:魔力エキス<br/><span className="text-amber-600 font-bold">🔥討伐ボーナス: 知恵+1</span></p>}
+                    {m.id === 'm5' && <p>1-3:肉 / 4-5:卵 / 6:肉+卵</p>}
+                    {m.id === 'm6' && <p className="text-red-600 font-bold">確定ドロップ: 肉+骨</p>}
+                    {m.id === 'm7' && <p>1-2:卵 / 3-5:肉 / 6:竜の極上肉</p>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modalState?.type === 'confirmHunt' && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-6 rounded-2xl max-w-sm w-full shadow-2xl border-4 border-amber-300 text-center">
+            <h2 className="text-xl font-bold mb-2">「{modalState.monster.name}」を狩るね！</h2>
+            <p className="text-gray-600 mb-4 bg-gray-100 p-2 rounded">狩猟判定: 🎯 {modalState.monster.target}以上で成功</p>
+            
+            <div className="mb-6 bg-yellow-50 border border-yellow-200 p-4 rounded-xl">
+              <p className="font-bold text-yellow-800 mb-2 flex items-center justify-center">
+                <Brain className="mr-1" size={18}/> 知恵トークン使う？
+              </p>
+              <div className="flex items-center justify-center gap-4">
+                <button 
+                  onClick={() => setModalState(prev => ({ ...prev, chieUsed: Math.max(0, prev.chieUsed - 1) }))}
+                  className="w-8 h-8 rounded-full bg-gray-200 font-bold hover:bg-gray-300 disabled:opacity-30"
+                  disabled={modalState.chieUsed === 0}
+                >-</button>
+                <span className="text-2xl font-black w-8 text-center">{modalState.chieUsed}</span>
+                <button 
+                  onClick={() => setModalState(prev => ({ ...prev, chieUsed: Math.min(players.p1.chie, prev.chieUsed + 1) }))}
+                  className="w-8 h-8 rounded-full bg-yellow-400 font-bold hover:bg-yellow-500 disabled:opacity-30"
+                  disabled={modalState.chieUsed >= players.p1.chie}
+                >+</button>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">所持: {players.p1.chie}個 (1個につき出目+1)</p>
+            </div>
+
+            <div className="flex gap-2">
+              <button 
+                onClick={() => setModalState({ type: 'selectMonster' })}
+                className="flex-1 py-3 bg-gray-200 text-gray-700 font-bold rounded-xl"
+              >
+                やめる
+              </button>
+              <button 
+                onClick={() => handleHuntStart(modalState.monster, modalState.chieUsed)}
+                className="flex-1 py-3 bg-red-500 text-white font-bold rounded-xl shadow shadow-red-200"
+              >
+                ダイスを振る！
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {modalState?.type === 'dropDice' && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-6 rounded-2xl max-w-sm w-full shadow-2xl border-4 border-amber-300 text-center">
+            <h2 className="text-xl font-bold mb-2">狩猟成功！次はドロップ判定！</h2>
+            <p className="text-gray-600 mb-4">出目によって手に入る素材が変わるよ。</p>
+            
+            <div className="mb-6 bg-yellow-50 border border-yellow-200 p-4 rounded-xl">
+              <p className="font-bold text-yellow-800 mb-2 flex items-center justify-center">
+                <Brain className="mr-1" size={18}/> 知恵トークンで出目を足す？
+              </p>
+              <div className="flex items-center justify-center gap-4">
+                <button 
+                  onClick={() => setModalState(prev => ({ ...prev, chieUsed: Math.max(0, prev.chieUsed - 1) }))}
+                  className="w-8 h-8 rounded-full bg-gray-200 font-bold hover:bg-gray-300 disabled:opacity-30"
+                  disabled={modalState.chieUsed === 0}
+                >-</button>
+                <span className="text-2xl font-black w-8 text-center">{modalState.chieUsed}</span>
+                <button 
+                  onClick={() => setModalState(prev => ({ ...prev, chieUsed: Math.min(players.p1.chie, prev.chieUsed + 1) }))}
+                  className="w-8 h-8 rounded-full bg-yellow-400 font-bold hover:bg-yellow-500 disabled:opacity-30"
+                  disabled={modalState.chieUsed >= players.p1.chie}
+                >+</button>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">所持: {players.p1.chie}個</p>
+            </div>
+
+            <button 
+              onClick={() => handleDropRoll(modalState.monster, modalState.chieUsed)}
+              className="w-full py-3 bg-blue-500 text-white font-bold rounded-xl shadow shadow-blue-200 text-lg"
+            >
+              ドロップ判定ダイス！
+            </button>
+          </div>
+        </div>
+      )}
+
+      {modalState?.type === 'discard' && (
+        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4">
+          <div className="bg-white p-6 rounded-2xl max-w-md w-full shadow-2xl border-4 border-red-400">
+            <h2 className="text-xl font-black text-red-600 mb-2">素材がいっぱいだよ！</h2>
+            <p className="text-gray-700 font-bold mb-4">
+              持てる素材は5個まで！あと <span className="text-red-500 text-xl">{modalState.dropCount}</span> 個捨ててね。
+            </p>
+            
+            <div className="flex flex-wrap gap-2 mb-6 p-4 bg-gray-50 rounded-xl border border-gray-200">
+              {modalState.items.map((item, i) => (
+                <button 
+                  key={i}
+                  onClick={() => {
+                    let newItems = [...modalState.items];
+                    newItems.splice(i, 1);
+                    if (modalState.dropCount - 1 === 0) {
+                      handleDiscard(newItems);
+                    } else {
+                      setModalState(prev => ({ ...prev, items: newItems, dropCount: prev.dropCount - 1 }));
+                    }
+                  }}
+                  className={`px-3 py-2 rounded-lg font-bold border-2 transition hover:opacity-70 ${ITEM_COLORS[item]} shadow-sm`}
+                >
+                  <X size={16} className="inline mr-1 opacity-50"/>{item}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-gray-500 text-center">捨てたい素材をクリックしてね！</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
